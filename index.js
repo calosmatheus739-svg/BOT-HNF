@@ -1,39 +1,39 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, Events } = require("discord.js");
+const { Client, GatewayIntentBits, Events, EmbedBuilder } = require("discord.js");
 const express = require("express");
 const axios   = require("axios");
 
-// ── ENV ────────────────────────────────────────────────────────
-const DISCORD_TOKEN      = process.env.DISCORD_TOKEN;
-const ROBLOX_API_KEY     = process.env.ROBLOX_API_KEY;
-const ROBLOX_UNIVERSE_ID = process.env.ROBLOX_UNIVERSE_ID;
-const ADMIN_CHANNEL_ID   = process.env.ADMIN_CHANNEL_ID;
-const ALLOWED_ROLE_ID    = process.env.ALLOWED_ROLE_ID;
-const PORT               = process.env.PORT || 3000;
+// ═══════════════════════════════════════════════════════════════
+// ENV
+// ═══════════════════════════════════════════════════════════════
+const {
+    DISCORD_TOKEN,
+    ROBLOX_API_KEY,
+    ROBLOX_UNIVERSE_ID,
+    ADMIN_CHANNEL_ID,
+    ALLOWED_ROLE_ID,
+    PORT = "3000",
+} = process.env;
 
-// ── DISCORD CLIENT (uma única instância, sem sharding) ─────────
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-    ],
-});
-
-// ── DEDUP ──────────────────────────────────────────────────────
-// Guarda IDs de mensagens já processadas nesta instância.
-// Resolve duplicatas causadas por reconexões do WebSocket do discord.js.
-// Para garantir UMA instância no Railway: mantenha APENAS 1 deployment ativo.
-const handled = new Set();
-function alreadyHandled(id) {
-    if (handled.has(id)) return true;
-    handled.add(id);
-    setTimeout(() => handled.delete(id), 30_000);
+// ═══════════════════════════════════════════════════════════════
+// ANTI-DUPLICATE
+// Cada mensagem tem um ID único do Discord.
+// Guardamos por 60s — cobre qualquer reconexão de WebSocket
+// e evita que 2 deployments ativos disparem o mesmo comando.
+// IMPORTANTE: no Railway, mantenha APENAS 1 deployment ativo.
+// ═══════════════════════════════════════════════════════════════
+const _seen = new Map(); // id → timestamp
+function seen(id) {
+    if (_seen.has(id)) return true;
+    _seen.set(id, Date.now());
+    setTimeout(() => _seen.delete(id), 60_000);
     return false;
 }
 
-// ── ROBLOX MESSAGING ───────────────────────────────────────────
-async function sendToRoblox(payload) {
+// ═══════════════════════════════════════════════════════════════
+// ROBLOX MESSAGING SERVICE
+// ═══════════════════════════════════════════════════════════════
+async function roblox(payload) {
     await axios.post(
         `https://apis.roblox.com/messaging-service/v1/universes/${ROBLOX_UNIVERSE_ID}/topics/AdminCommands`,
         { message: JSON.stringify(payload) },
@@ -41,8 +41,10 @@ async function sendToRoblox(payload) {
     );
 }
 
-// ── COMANDOS ───────────────────────────────────────────────────
-const SKIN_MAP = {
+// ═══════════════════════════════════════════════════════════════
+// COMANDOS — espelho exato do TreatService.lua
+// ═══════════════════════════════════════════════════════════════
+const SKINS = {
     ":witch":         { skins: ["AgathaHarknessBad", "AgathaHarknessYouth"] },
     ":firefairy":     { skins: ["Bloom", "DarkBloom"] },
     ":devilfied":     { skins: ["MagikDevil"] },
@@ -86,7 +88,7 @@ const SKIN_MAP = {
     ":unzee":         { skins: ["ZatannaZeZe"],          remove: true },
 };
 
-const ROLE_MAP = {
+const ROLES = {
     ":iconic":        { role: "Iconic",      give: true  },
     ":uniconic":      { role: "Iconic",      give: false },
     ":honored":       { role: "Honored",     give: true  },
@@ -103,117 +105,191 @@ const ROLE_MAP = {
     ":unjoker":       { role: "Joker",       give: false },
 };
 
-const TAG_MAP = {
+const TAGS = {
     ":givevip":     "VipTag",
     ":giverainbow": "RainbowTag",
     ":givepink":    "PinkTag",
 };
 
-// ── HANDLER ────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// EMBEDS
+// ═══════════════════════════════════════════════════════════════
+function embed(color, title, fields = []) {
+    const e = new EmbedBuilder().setColor(color).setTitle(title).setTimestamp();
+    if (fields.length) e.addFields(fields);
+    return { embeds: [e] };
+}
+
+const OK   = (title, fields) => embed(0x57F287, `✅  ${title}`, fields);
+const ERR  = (title, fields) => embed(0xED4245, `❌  ${title}`, fields);
+const INFO = (title, fields) => embed(0x5865F2, `ℹ️  ${title}`, fields);
+
+function field(name, value, inline = true) { return { name, value: `\`${value}\``, inline }; }
+
+// ═══════════════════════════════════════════════════════════════
+// DISCORD CLIENT
+// ═══════════════════════════════════════════════════════════════
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ],
+});
+
 client.on(Events.MessageCreate, async (msg) => {
-    // Filtros básicos
-    if (msg.author.bot)                          return;
-    if (msg.channel.id !== ADMIN_CHANNEL_ID)     return;
-    if (alreadyHandled(msg.id))                  return;
+    // ── Filtros iniciais ──────────────────────────────────────
+    if (msg.author.bot)                      return;
+    if (msg.channel.id !== ADMIN_CHANNEL_ID) return;
+    if (seen(msg.id))                        return; // anti-duplicate
 
-    // Permissão
-    if (!msg.member?.roles.cache.has(ALLOWED_ROLE_ID))
-        return msg.reply("❌ Você não tem permissão.");
+    const member = msg.member;
+    if (!member?.roles.cache.has(ALLOWED_ROLE_ID)) return; // sem permissão → ignora silenciosamente
 
-    const args   = msg.content.trim().split(/\s+/);
-    const cmd    = args[0].toLowerCase();
-    const target = args[1] ?? null;
+    const parts  = msg.content.trim().split(/\s+/);
+    const cmd    = parts[0].toLowerCase();
+    const target = parts[1];
     const sender = msg.author.username;
+
+    // ── Deleta a mensagem de comando (canal limpo) ────────────
+    msg.delete().catch(() => {});
 
     try {
 
-        // ── :giveskin <player> <Skin1,Skin2,...> ──────────────
+        // ── :giveskin <player> <Skin1,Skin2> ─────────────────
         if (cmd === ":giveskin") {
-            if (!target || !args[2]) return msg.reply("❌ Uso: `:giveskin <player> <Skin1,Skin2,...>`");
-            const skins = args[2].split(",").map(s => s.trim()).filter(Boolean);
-            for (const skin of skins)
-                await sendToRoblox({ cmd: "giveskin", identifier: target, skin, sender });
-            return msg.reply(`✅ ${skins.length} skin(s) enviada(s) para **${target}**: \`${skins.join(", ")}\``);
+            if (!target || !parts[2])
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", ":giveskin <player> <Skin1,Skin2,...>")]));
+            const skins = parts[2].split(",").map(s => s.trim()).filter(Boolean);
+            for (const skin of skins) await roblox({ cmd: "giveskin", identifier: target, skin, sender });
+            return msg.channel.send(OK("Skin enviada", [
+                field("Player",  target),
+                field("Skin(s)", skins.join(", ")),
+                field("Admin",   sender),
+            ]));
         }
 
-        // ── :removeskin <player> <Skin1,Skin2,...> ────────────
+        // ── :removeskin <player> <Skin1,Skin2> ───────────────
         if (cmd === ":removeskin") {
-            if (!target || !args[2]) return msg.reply("❌ Uso: `:removeskin <player> <Skin1,Skin2,...>`");
-            const skins = args[2].split(",").map(s => s.trim()).filter(Boolean);
-            for (const skin of skins)
-                await sendToRoblox({ cmd: "removeskin", identifier: target, skin, sender });
-            return msg.reply(`✅ ${skins.length} skin(s) removida(s) de **${target}**: \`${skins.join(", ")}\``);
+            if (!target || !parts[2])
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", ":removeskin <player> <Skin1,Skin2,...>")]));
+            const skins = parts[2].split(",").map(s => s.trim()).filter(Boolean);
+            for (const skin of skins) await roblox({ cmd: "removeskin", identifier: target, skin, sender });
+            return msg.channel.send(OK("Skin removida", [
+                field("Player",  target),
+                field("Skin(s)", skins.join(", ")),
+                field("Admin",   sender),
+            ]));
         }
 
-        // ── :coins <player> <quantidade> ──────────────────────
+        // ── :coins <player> <quantidade> ─────────────────────
         if (cmd === ":coins") {
-            const amount = parseInt(args[2]);
-            if (!target || isNaN(amount)) return msg.reply("❌ Uso: `:coins <player> <quantidade>`");
-            await sendToRoblox({ cmd: "coins", identifier: target, amount, sender });
-            return msg.reply(`✅ **${amount.toLocaleString()}** coins enviadas para **${target}**.`);
+            const amount = parseInt(parts[2]);
+            if (!target || isNaN(amount))
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", ":coins <player> <quantidade>")]));
+            await roblox({ cmd: "coins", identifier: target, amount, sender });
+            return msg.channel.send(OK("Coins enviadas", [
+                field("Player",     target),
+                field("Quantidade", amount.toLocaleString()),
+                field("Admin",      sender),
+            ]));
         }
 
-        // ── :givevip / :giverainbow / :givepink ───────────────
-        if (TAG_MAP[cmd]) {
-            if (!target) return msg.reply(`❌ Uso: \`${cmd} <player>\``);
-            const tag = TAG_MAP[cmd];
-            await sendToRoblox({ cmd: "givetag", identifier: target, tag, sender });
-            return msg.reply(`✅ Tag **${tag}** enviada para **${target}**.`);
+        // ── :givevip / :giverainbow / :givepink ──────────────
+        if (TAGS[cmd]) {
+            if (!target)
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", `${cmd} <player>`)]));
+            const tag = TAGS[cmd];
+            await roblox({ cmd: "givetag", identifier: target, tag, sender });
+            return msg.channel.send(OK("Tag enviada", [
+                field("Player", target),
+                field("Tag",    tag),
+                field("Admin",  sender),
+            ]));
         }
 
-        // ── :givetag <player> <tagName> ───────────────────────
+        // ── :givetag <player> <tagName> ──────────────────────
         if (cmd === ":givetag") {
-            if (!target || !args[2]) return msg.reply("❌ Uso: `:givetag <player> <tagName>`");
-            await sendToRoblox({ cmd: "givetag", identifier: target, tag: args[2], sender });
-            return msg.reply(`✅ Tag **${args[2]}** enviada para **${target}**.`);
+            if (!target || !parts[2])
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", ":givetag <player> <tagName>")]));
+            await roblox({ cmd: "givetag", identifier: target, tag: parts[2], sender });
+            return msg.channel.send(OK("Tag enviada", [
+                field("Player", target),
+                field("Tag",    parts[2]),
+                field("Admin",  sender),
+            ]));
         }
 
-        // ── :setrole <player> <role> <true|false> ─────────────
+        // ── :setrole <player> <role> <true|false> ────────────
         if (cmd === ":setrole") {
-            if (!target || !args[2] || args[3] === undefined)
-                return msg.reply("❌ Uso: `:setrole <player> <role> <true/false>`");
-            const give = args[3] === "true";
-            await sendToRoblox({ cmd: "setrole", identifier: target, role: args[2], give, sender });
-            return msg.reply(`✅ Role **${args[2]}** ${give ? "dada a" : "removida de"} **${target}**.`);
+            if (!target || !parts[2] || parts[3] === undefined)
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", ":setrole <player> <role> <true/false>")]));
+            const give = parts[3] === "true";
+            await roblox({ cmd: "setrole", identifier: target, role: parts[2], give, sender });
+            return msg.channel.send(OK(give ? "Role concedida" : "Role removida", [
+                field("Player", target),
+                field("Role",   parts[2]),
+                field("Admin",  sender),
+            ]));
         }
 
-        // ── :disablepowers / :enablepowers ────────────────────
+        // ── :disablepowers / :enablepowers ───────────────────
         if (cmd === ":disablepowers" || cmd === ":enablepowers") {
-            await sendToRoblox({ cmd: cmd.slice(1), sender });
-            return msg.reply(`✅ **${cmd === ":enablepowers" ? "Poderes ativados" : "Poderes desativados"}** para todos.`);
+            const enable = cmd === ":enablepowers";
+            await roblox({ cmd: cmd.slice(1), sender });
+            return msg.channel.send(OK(enable ? "Poderes ativados" : "Poderes desativados", [
+                field("Afeta",  "Todos os players"),
+                field("Admin",  sender),
+            ]));
         }
 
-        // ── Skin shortcuts (:lorefied, :witch, etc.) ──────────
-        if (SKIN_MAP[cmd]) {
-            if (!target) return msg.reply(`❌ Uso: \`${cmd} <player>\``);
-            const { skins, remove } = SKIN_MAP[cmd];
+        // ── Skin shortcuts (:lorefied, :witch, etc.) ─────────
+        if (SKINS[cmd]) {
+            if (!target)
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", `${cmd} <player>`)]));
+            const { skins, remove } = SKINS[cmd];
             for (const skin of skins)
-                await sendToRoblox({ cmd: remove ? "removeskin" : "giveskin", identifier: target, skin, sender });
-            return msg.reply(
-                `✅ \`${skins.join(", ")}\` ${remove ? "removida(s) de" : "enviada(s) para"} **${target}**.`
-            );
+                await roblox({ cmd: remove ? "removeskin" : "giveskin", identifier: target, skin, sender });
+            return msg.channel.send(OK(remove ? "Skin removida" : "Skin enviada", [
+                field("Player",  target),
+                field("Skin(s)", skins.join(", ")),
+                field("Admin",   sender),
+            ]));
         }
 
-        // ── Role shortcuts (:iconic, :honored, etc.) ──────────
-        if (ROLE_MAP[cmd]) {
-            if (!target) return msg.reply(`❌ Uso: \`${cmd} <player>\``);
-            const { role, give } = ROLE_MAP[cmd];
-            await sendToRoblox({ cmd: "setrole", identifier: target, role, give, sender });
-            return msg.reply(`✅ Role **${role}** ${give ? "dada a" : "removida de"} **${target}**.`);
+        // ── Role shortcuts (:iconic, :honored, etc.) ─────────
+        if (ROLES[cmd]) {
+            if (!target)
+                return msg.channel.send(ERR("Uso incorreto", [field("Sintaxe", `${cmd} <player>`)]));
+            const { role, give } = ROLES[cmd];
+            await roblox({ cmd: "setrole", identifier: target, role, give, sender });
+            return msg.channel.send(OK(give ? "Role concedida" : "Role removida", [
+                field("Player", target),
+                field("Role",   role),
+                field("Admin",  sender),
+            ]));
         }
 
     } catch (err) {
-        console.error(`[ERRO] ${cmd}:`, err.message);
-        return msg.reply(`❌ Erro ao enviar para o Roblox: \`${err.message}\``);
+        console.error(`[ERRO] ${cmd} →`, err.message);
+        msg.channel.send(ERR("Falha na comunicação com o Roblox", [
+            field("Comando", cmd),
+            field("Erro",    err.message, false),
+        ]));
     }
 });
 
-// ── HTTP (Railway keepalive) ───────────────────────────────────
+client.once(Events.ClientReady, () => {
+    console.log(`[Bot] Online como ${client.user.tag}`);
+    client.user.setActivity("HNF Admin", { type: 3 }); // "Watching HNF Admin"
+});
+
+// ═══════════════════════════════════════════════════════════════
+// HTTP — Railway keepalive
+// ═══════════════════════════════════════════════════════════════
 const app = express();
 app.use(express.json());
 app.get("/", (_req, res) => res.send("HNF Bot online ✅"));
-app.listen(PORT, () => console.log(`[Bot] HTTP na porta ${PORT}`));
+app.listen(Number(PORT), () => console.log(`[Bot] HTTP na porta ${PORT}`));
 
-// ── START ──────────────────────────────────────────────────────
-client.once(Events.ClientReady, () => console.log(`[Bot] Online como ${client.user.tag}`));
 client.login(DISCORD_TOKEN);
